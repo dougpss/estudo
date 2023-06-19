@@ -1,0 +1,248 @@
+Airflow Prod & Staging is filling the host disk (docker) with logging that is not being cleaned.
+
+When you change the “base_log_folder” in airflow you must also change “dag_processor_manager_log_location” and “dag_processor_manager_log_location” settings to point to the new path as well. I will place a change for fixing it in staging and then in production.
+
+Airflow Prod & Staging is filling the host disk (docker) with logging that is not being cleaned.
+
+We will be setting the variables “dag_processor_manager_log_location” and  “child_process_log_directory” on airflow staging stack to match the value of the “base_log_folder” variable, so that all airflow logs will be kept on the same location and be managed by the logs cleanup dag.
+
+
+
+TASK##
+
+Backup the airflow -stage stack configuration on portainer.
+
+TASK##
+
+On portainer, airflow-stage update the stack adding the variables bellow with the value “/home/airflow/logs”
+
+AIRFLOW__LOGGING__DAG_PROCESSOR_MANAGER_LOG_LOCATION     AIRFLOW__SCHEDULER__CHILD_PROCESS_LOG_DIRECTORY
+
+TASK##
+
+Validate that the logs folder “dag_processor_manager” and “scheduler” were created under /home/airflow/logs.
+
+FALLBACK TASK
+
+Restore the backed up configuration file and update the stack.
+
+
+
+---
+version: '3.8'
+
+networks:
+  proxy-net:
+    external: true
+  airflow-stage-net:
+    external: true
+
+x-common:
+  environment:
+    &common-env
+      REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-/etc/ssl/certs}
+      AWS_CA_BUNDLE: ${AWS_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}
+      OIDC_ENABLED: ${OIDC_ENABLED:-false}
+      OIDC_HOST: ${OIDC_HOST:-keycloak.local}
+      OIDC_IP: ${OIDC_IP:-127.0.0.1}
+      OIDC_REALM: ${OIDC_REALM:-/realms/Default}
+      OIDC_ISSUER: https://${OIDC_HOST}${OIDC_REALM}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-airflow}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-H99LXNgzP9UWtM4Wg6WKavmvv0vDXbxZ}
+      SQLALCHEMY_SILENCE_UBER_WARNING: 1
+
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-dockercache.mountaininfra.net/nordsec-analytics/docker/images/anna-airflow:2.5.1-v2}
+  environment:
+    &airflow-common-env
+    <<: *common-env
+    AIRFLOW__LOGGING__LOGGING_LEVEL: ${AIRFLOW__LOGGING__LOGGING_LEVEL:-INFO}
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB}  
+    # For backward compatibility, with Airflow <2.3
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_DB}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__LOGGING__BASE_LOG_FOLDER: /home/airflow/logs
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES:-true}
+    AIRFLOW__LOGGING__REMOTE_LOGGING: ${AIRFLOW__LOGGING__REMOTE_LOGGING:-false}
+    AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: ${AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID:-airflowLogs}
+    AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: ${AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER:-s3://airflow/logs}
+    AIRFLOW__LOGGING__ENCRYPT_S3_LOGS: ${AIRFLOW__LOGGING__ENCRYPT_S3_LOGS:-false}
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+    AIRFLOW__WEBSERVER__BASE_URL: ${AIRFLOW__WEBSERVER__BASE_URL:-http://localhost:8080/}
+    AIRFLOW__LOGGING__LOG_FILENAME_TEMPLATE: ${AIRFLOW__LOGGING__LOG_FILENAME_TEMPLATE}
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG:-false}
+    AIRFLOW__WEBSERVER__NAVBAR_COLOR: ${AIRFLOW__WEBSERVER__NAVBAR_COLOR:-#fff}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-/tmp/airflow}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-/tmp/airflow}/logs:/home/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-/tmp/airflow}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-/tmp/airflow}/.ssh:/home/airflow/.ssh
+  networks:
+    - proxy-net
+    - airflow-stage-net
+  dns:
+    - 172.21.247.57
+  extra_hosts:
+    - "${OIDC_HOST}:${OIDC_IP}"
+    - "${MINIO_HOST}:${MINIO_IP}"
+
+services:
+  redis:
+    image: dockercache.mountaininfra.net/redis:latest
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 30s
+      retries: 50
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+        - node.role == manager
+        - node.labels.function.airflow_stage == true
+        max_replicas_per_node: 1
+      endpoint_mode: dnsrr
+    networks:
+      - airflow-stage-net
+
+  pgbouncer:
+    image: docker.io/bitnami/pgbouncer:1
+    environment:
+      - POSTGRESQL_HOST=${POSTGRESQL_HOST}
+      - POSTGRESQL_PORT=${POSTGRESQL_PORT}
+      - POSTGRESQL_USERNAME=${POSTGRESQL_USERNAME}
+      - POSTGRESQL_PASSWORD=${POSTGRESQL_PASSWORD}
+      - POSTGRESQL_DATABASE=${POSTGRESQL_DATABASE}
+      - PGBOUNCER_DATABASE=${POSTGRESQL_DATABASE}
+      - PGBOUNCER_USERLIST=${PGBOUNCER_USERLIST}
+      - PGBOUNCER_POOL_MODE=transaction
+      - PGBOUNCER_LOG_CONNECTIONS=0
+      - PGBOUNCER_LOG_DISCONNECTIONS=0
+      - PGBOUNCER_AUTH_TYPE=trust
+      - PGBOUNCER_IGNORE_STARTUP_PARAMETERS=extra_float_digits
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+        - node.role == manager
+        - node.labels.function.airflow_stage == true
+        max_replicas_per_node: 1
+      endpoint_mode: dnsrr
+    networks:
+      - proxy-net
+      - airflow-stage-net
+    hostname: "gcp-stage-anna-airflow-pgbouncer"
+
+  webserver:
+    <<: *airflow-common
+    command: /entrypoint.sh airflow webserver
+    healthcheck:
+      test: ["CMD-SHELL", "gosu airflow /bin/bash -c 'curl --fail \"http://localhost:8080/health\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+        - node.role == manager
+        - node.labels.function.airflow_stage == true
+        max_replicas_per_node: 1
+      endpoint_mode: dnsrr
+    hostname: "gcp-stage-anna-airflow-webserver-{{.Task.Slot}}"
+
+  scheduler:
+    <<: *airflow-common
+    command: /entrypoint.sh airflow scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "gosu airflow /bin/bash -c 'airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    deploy:
+      mode: replicated
+      replicas: 2
+      placement:
+        constraints:
+        - node.role == manager
+        - node.labels.function.airflow_stage == true
+        max_replicas_per_node: 1
+      endpoint_mode: dnsrr
+    hostname: "gcp-stage-anna-airflow-scheduler-{{.Task.Slot}}"
+
+  worker:
+    <<: *airflow-common
+    command: /entrypoint.sh airflow celery worker
+    healthcheck:
+      test: ["CMD-SHELL", "gosu airflow /bin/bash -c 'celery --app airflow.executors.celery_executor.app inspect ping -d \"celery@$${HOSTNAME}\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    deploy:
+      mode: replicated
+      replicas: 3
+      placement:
+        constraints:
+        - node.role == worker
+        - node.labels.function.airflow_stage == true
+        max_replicas_per_node: 1
+      endpoint_mode: dnsrr
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    hostname: "gcp-stage-anna-airflow-worker-{{.Task.Slot}}"
+
+  triggerer:
+    <<: *airflow-common
+    command: /entrypoint.sh airflow triggerer
+    healthcheck:
+      test: ["CMD-SHELL", "gosu airflow /bin/bash -c 'airflow jobs check --job-type TriggererJob --hostname \"$${HOSTNAME}\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+        - node.role == manager
+        - node.labels.function.airflow_stage == true
+        max_replicas_per_node: 1
+      endpoint_mode: dnsrr
+    hostname: "gcp-stage-anna-airflow-triggerer-{{.Task.Slot}}"
+
+  init:
+    <<: *airflow-common
+    command: /entrypoint.sh airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-/tmp/airflow}/:/sources
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+        - node.role == manager
+        - node.labels.function.airflow_stage == true
+        max_replicas_per_node: 1
+      endpoint_mode: dnsrr
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
